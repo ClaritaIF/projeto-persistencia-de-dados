@@ -25,6 +25,7 @@ export async function connectDatabases() {
   await pool.query(`CREATE TABLE IF NOT EXISTS operation_log (
     id UUID PRIMARY KEY, scenario TEXT NOT NULL, state TEXT NOT NULL, steps JSONB NOT NULL, created_at TIMESTAMPTZ DEFAULT NOW()
   )`);
+  await pool.query('ALTER TABLE operation_log ADD COLUMN IF NOT EXISTS transaction_view JSONB');
   await retry('MongoDB/replica set', () => mongo.connect());
   await db().collection('customers').createIndex({ id: 1 }, { unique: true });
 }

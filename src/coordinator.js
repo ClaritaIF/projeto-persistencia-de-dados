@@ -10,7 +10,7 @@ function newOperation(scenario) {
 }
 function step(op, phase, detail, status = 'ok') { op.steps.push({ at: new Date().toISOString(), phase, detail, status }); }
 async function saveLog(op) {
-  await pool.query('INSERT INTO operation_log (id,scenario,state,steps) VALUES ($1,$2,$3,$4)', [op.id, op.scenario, op.state, JSON.stringify(op.steps)]);
+  await pool.query('INSERT INTO operation_log (id,scenario,state,steps,transaction_view) VALUES ($1,$2,$3,$4,$5)', [op.id, op.scenario, op.state, JSON.stringify(op.steps), JSON.stringify(op.transactionView || null)]);
   activeOperations.delete(op.id);
 }
 
@@ -21,10 +21,16 @@ export async function postgresThenMongo(input) {
   try {
     step(op, 'PREPARE', 'Validação do payload e reserva do identificador global.');
     await client.query('BEGIN');
-    await client.query('INSERT INTO customers (id,name,email,status,version) VALUES ($1,$2,$3,$4,$5)', Object.values(customer));
+    const inserted = await client.query('INSERT INTO customers (id,name,email,status,version) VALUES ($1,$2,$3,$4,$5) RETURNING id,name,email,status,version,created_at', Object.values(customer));
+    op.transactionView = {
+      database: 'PostgreSQL',
+      command: 'INSERT INTO customers (...) VALUES (...) RETURNING id, name, email, status, version, created_at;',
+      readMethod: 'Resultado retornado pelo PostgreSQL na mesma transação aberta',
+      record: inserted.rows[0]
+    };
     step(op, 'PREPARE', 'PostgreSQL gravou a alteração dentro de uma transação aberta.');
     step(op, 'WAITING', 'Registro ainda está invisível para consultas externas: aguarda a decisão do coordenador.', 'running');
-    await sleep(900);
+    await sleep(2400);
     step(op, 'COMMIT', 'Tentativa de persistência no MongoDB.', 'running');
     throw new Error('Falha induzida: MongoDB recusou a gravação.');
   } catch (error) {
@@ -41,10 +47,18 @@ export async function mongoThenPostgres(input) {
   try {
     step(op, 'PREPARE', 'Validação do payload e reserva do identificador global.');
     session.startTransaction();
-    await db().collection('customers').insertOne({ ...customer, createdAt: new Date() }, { session });
+    const collection = db().collection('customers');
+    await collection.insertOne({ ...customer, createdAt: new Date() }, { session });
+    const inserted = await collection.findOne({ id: customer.id }, { session, projection: { _id: 0 } });
+    op.transactionView = {
+      database: 'MongoDB',
+      command: 'db.customers.insertOne({...}, { session }); db.customers.findOne({ id }, { session });',
+      readMethod: 'Documento lido pelo MongoDB na mesma sessão transacional',
+      record: inserted
+    };
     step(op, 'PREPARE', 'MongoDB gravou o documento em uma transação aberta.');
     step(op, 'WAITING', 'Documento ainda está invisível para consultas externas: aguarda a decisão do coordenador.', 'running');
-    await sleep(900);
+    await sleep(2400);
     step(op, 'COMMIT', 'Tentativa de persistência no PostgreSQL.', 'running');
     throw new Error('Falha induzida: PostgreSQL recusou a gravação.');
   } catch (error) {
@@ -86,9 +100,9 @@ export async function snapshot() {
   const [pgRows, mongoRows, operationRows] = await Promise.all([
     pool.query('SELECT id,name,email,status,version,created_at FROM customers ORDER BY created_at DESC'),
     db().collection('customers').find({}, { projection: { _id: 0, createdAt: 0 } }).toArray(),
-    pool.query('SELECT id,scenario,state,steps,created_at FROM operation_log ORDER BY created_at DESC LIMIT 15')
+    pool.query('SELECT id,scenario,state,steps,transaction_view,created_at FROM operation_log ORDER BY created_at DESC LIMIT 15')
   ]);
-  const completedOperations = operationRows.rows.map(row => ({ id: row.id, scenario: row.scenario, state: row.state, steps: row.steps, startedAt: row.created_at }));
+  const completedOperations = operationRows.rows.map(row => ({ id: row.id, scenario: row.scenario, state: row.state, steps: row.steps, transactionView: row.transaction_view, startedAt: row.created_at }));
   const operations = [...activeOperations.values(), ...completedOperations].slice(0, 15);
   return { postgres: pgRows.rows, mongo: mongoRows, operations, observedAt: new Date().toISOString() };
 }
