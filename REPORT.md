@@ -2,7 +2,7 @@
 
 ## Arquitetura
 
-O sistema tem um front-end de observabilidade, uma API Node.js (o coordenador) e dois participantes: PostgreSQL e MongoDB. O coordenador registra cada fase no `operation_log` do PostgreSQL. O painel faz leitura dos dois participantes a cada **10 ms** e expõe o livro de operações.
+O sistema tem um front-end de observabilidade, uma API Node.js (o coordenador) e dois participantes: PostgreSQL e MongoDB. O coordenador registra cada fase no `operation_log` do PostgreSQL. O painel faz leitura dos dois participantes a cada **10 ms** e exibe uma trilha em tempo real: durante `PREPARING`, ela mostra a inserção dentro da transação, enquanto as tabelas continuam sem o dado por causa do isolamento transacional.
 
 ```
 Browser ──HTTP──> Coordenador Node.js ──> PostgreSQL (customers + operation_log)

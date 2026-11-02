@@ -2,13 +2,16 @@ import crypto from 'node:crypto';
 import { pool, db, mongo } from './db.js';
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+const activeOperations = new Map();
 function newOperation(scenario) {
   const op = { id: crypto.randomUUID(), scenario, state: 'PREPARING', startedAt: new Date().toISOString(), steps: [] };
+  activeOperations.set(op.id, op);
   return op;
 }
 function step(op, phase, detail, status = 'ok') { op.steps.push({ at: new Date().toISOString(), phase, detail, status }); }
 async function saveLog(op) {
   await pool.query('INSERT INTO operation_log (id,scenario,state,steps) VALUES ($1,$2,$3,$4)', [op.id, op.scenario, op.state, JSON.stringify(op.steps)]);
+  activeOperations.delete(op.id);
 }
 
 export async function postgresThenMongo(input) {
@@ -20,6 +23,8 @@ export async function postgresThenMongo(input) {
     await client.query('BEGIN');
     await client.query('INSERT INTO customers (id,name,email,status,version) VALUES ($1,$2,$3,$4,$5)', Object.values(customer));
     step(op, 'PREPARE', 'PostgreSQL gravou a alteração dentro de uma transação aberta.');
+    step(op, 'WAITING', 'Registro ainda está invisível para consultas externas: aguarda a decisão do coordenador.', 'running');
+    await sleep(900);
     step(op, 'COMMIT', 'Tentativa de persistência no MongoDB.', 'running');
     throw new Error('Falha induzida: MongoDB recusou a gravação.');
   } catch (error) {
@@ -38,6 +43,8 @@ export async function mongoThenPostgres(input) {
     session.startTransaction();
     await db().collection('customers').insertOne({ ...customer, createdAt: new Date() }, { session });
     step(op, 'PREPARE', 'MongoDB gravou o documento em uma transação aberta.');
+    step(op, 'WAITING', 'Documento ainda está invisível para consultas externas: aguarda a decisão do coordenador.', 'running');
+    await sleep(900);
     step(op, 'COMMIT', 'Tentativa de persistência no PostgreSQL.', 'running');
     throw new Error('Falha induzida: PostgreSQL recusou a gravação.');
   } catch (error) {
@@ -81,6 +88,7 @@ export async function snapshot() {
     db().collection('customers').find({}, { projection: { _id: 0, createdAt: 0 } }).toArray(),
     pool.query('SELECT id,scenario,state,steps,created_at FROM operation_log ORDER BY created_at DESC LIMIT 15')
   ]);
-  const operations = operationRows.rows.map(row => ({ id: row.id, scenario: row.scenario, state: row.state, steps: row.steps, startedAt: row.created_at }));
+  const completedOperations = operationRows.rows.map(row => ({ id: row.id, scenario: row.scenario, state: row.state, steps: row.steps, startedAt: row.created_at }));
+  const operations = [...activeOperations.values(), ...completedOperations].slice(0, 15);
   return { postgres: pgRows.rows, mongo: mongoRows, operations, observedAt: new Date().toISOString() };
 }
