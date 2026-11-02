@@ -9,7 +9,7 @@ Browser ──HTTP──> Coordenador Node.js ──> PostgreSQL (customers + op
                          └─────────────> MongoDB (customers)
 ```
 
-Como PostgreSQL e MongoDB não oferecem um único protocolo XA/2PC compartilhado, o projeto implementa **2PC no nível da aplicação**, usando uma fase de preparo, confirmação e **transação compensatória**. Isto evita prometer atomicidade global inexistente; para produção, a mesma abordagem deve incluir uma outbox durável, idempotência e um reconciliador.
+Como PostgreSQL e MongoDB não oferecem um único protocolo XA/2PC compartilhado, o projeto implementa **2PC no nível da aplicação**. Em cada participante há uma transação local aberta durante a fase `PREPARE`; diante de uma falha induzida, ela é abortada com `ROLLBACK` (PostgreSQL) ou `abortTransaction()` (MongoDB). Para atualizações já confirmadas por um participante, há compensação protegida por versão. Isto evita prometer atomicidade global inexistente; para produção, a mesma abordagem deve incluir uma outbox durável, idempotência e um reconciliador.
 
 ## Cenários executados
 

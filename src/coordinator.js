@@ -2,56 +2,59 @@ import crypto from 'node:crypto';
 import { pool, db, mongo } from './db.js';
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
-const operations = [];
 function newOperation(scenario) {
   const op = { id: crypto.randomUUID(), scenario, state: 'PREPARING', startedAt: new Date().toISOString(), steps: [] };
-  operations.unshift(op); return op;
+  return op;
 }
 function step(op, phase, detail, status = 'ok') { op.steps.push({ at: new Date().toISOString(), phase, detail, status }); }
 async function saveLog(op) {
   await pool.query('INSERT INTO operation_log (id,scenario,state,steps) VALUES ($1,$2,$3,$4)', [op.id, op.scenario, op.state, JSON.stringify(op.steps)]);
 }
 
-export function recentOperations() { return operations.slice(0, 15); }
-
 export async function postgresThenMongo(input) {
   const op = newOperation('PostgreSQL → MongoDB (falha no MongoDB)');
   const customer = { id: crypto.randomUUID(), name: input.name, email: input.email, status: 'active', version: 1 };
-  let pgInserted = false;
+  const client = await pool.connect();
   try {
     step(op, 'PREPARE', 'Validação do payload e reserva do identificador global.');
-    await pool.query('INSERT INTO customers (id,name,email,status,version) VALUES ($1,$2,$3,$4,$5)', Object.values(customer));
-    pgInserted = true; step(op, 'PREPARE', 'PostgreSQL gravou a alteração pendente de confirmação.');
+    await client.query('BEGIN');
+    await client.query('INSERT INTO customers (id,name,email,status,version) VALUES ($1,$2,$3,$4,$5)', Object.values(customer));
+    step(op, 'PREPARE', 'PostgreSQL gravou a alteração dentro de uma transação aberta.');
     step(op, 'COMMIT', 'Tentativa de persistência no MongoDB.', 'running');
     throw new Error('Falha induzida: MongoDB recusou a gravação.');
   } catch (error) {
-    if (pgInserted) { await pool.query('DELETE FROM customers WHERE id=$1', [customer.id]); step(op, 'COMPENSATE', 'Rollback compensatório: registro removido do PostgreSQL.'); }
+    await client.query('ROLLBACK');
+    step(op, 'ROLLBACK', 'Transação PostgreSQL desfeita; nenhum registro foi confirmado.');
     op.state = 'ABORTED'; step(op, 'ABORT', error.message, 'error'); await saveLog(op); return op;
-  }
+  } finally { client.release(); }
 }
 
 export async function mongoThenPostgres(input) {
   const op = newOperation('MongoDB → PostgreSQL (falha no PostgreSQL)');
   const customer = { id: crypto.randomUUID(), name: input.name, email: input.email, status: 'active', version: 1 };
-  let mongoInserted = false;
+  const session = mongo.startSession();
   try {
     step(op, 'PREPARE', 'Validação do payload e reserva do identificador global.');
-    await db().collection('customers').insertOne({ ...customer, createdAt: new Date() });
-    mongoInserted = true; step(op, 'PREPARE', 'MongoDB gravou o documento pendente de confirmação.');
+    session.startTransaction();
+    await db().collection('customers').insertOne({ ...customer, createdAt: new Date() }, { session });
+    step(op, 'PREPARE', 'MongoDB gravou o documento em uma transação aberta.');
     step(op, 'COMMIT', 'Tentativa de persistência no PostgreSQL.', 'running');
     throw new Error('Falha induzida: PostgreSQL recusou a gravação.');
   } catch (error) {
-    if (mongoInserted) { await db().collection('customers').deleteOne({ id: customer.id }); step(op, 'COMPENSATE', 'Rollback compensatório: documento removido do MongoDB.'); }
+    await session.abortTransaction();
+    step(op, 'ROLLBACK', 'Transação MongoDB abortada; nenhum documento foi confirmado.');
     op.state = 'ABORTED'; step(op, 'ABORT', error.message, 'error'); await saveLog(op); return op;
-  }
+  } finally { await session.endSession(); }
 }
 
 export async function seed() {
-  const found = await pool.query('SELECT COUNT(*)::int AS count FROM customers');
-  if (found.rows[0].count) return;
-  const customer = { id: crypto.randomUUID(), name: 'Ana Martins', email: 'ana@exemplo.com', status: 'active', version: 1 };
-  await pool.query('INSERT INTO customers (id,name,email,status,version) VALUES ($1,$2,$3,$4,$5)', Object.values(customer));
-  await db().collection('customers').insertOne({ ...customer, createdAt: new Date() });
+  let rows = (await pool.query('SELECT id,name,email,status,version FROM customers')).rows;
+  if (!rows.length) {
+    const customer = { id: crypto.randomUUID(), name: 'Ana Martins', email: 'ana@exemplo.com', status: 'active', version: 1 };
+    await pool.query('INSERT INTO customers (id,name,email,status,version) VALUES ($1,$2,$3,$4,$5)', Object.values(customer));
+    rows = [customer];
+  }
+  await Promise.all(rows.map(customer => db().collection('customers').updateOne({ id: customer.id }, { $setOnInsert: { ...customer, createdAt: new Date() } }, { upsert: true })));
 }
 
 export async function updateBoth() {
@@ -66,16 +69,18 @@ export async function updateBoth() {
   await sleep(80);
   const result = await db().collection('customers').updateOne({ id: row.id, version: row.version }, { $set: { status: next }, $inc: { version: 1 } });
   if (!result.modifiedCount) {
-    await pool.query('UPDATE customers SET status=$1, version=version-1 WHERE id=$2', [row.status, row.id]);
-    step(op, 'COMPENSATE', 'MongoDB não confirmou; atualização PostgreSQL desfeita.', 'error'); op.state = 'ABORTED';
+    const undo = await pool.query('UPDATE customers SET status=$1, version=version-1 WHERE id=$2 AND version=$3', [row.status, row.id, row.version + 1]);
+    step(op, 'COMPENSATE', undo.rowCount ? 'MongoDB não confirmou; atualização PostgreSQL desfeita.' : 'MongoDB não confirmou; compensação PostgreSQL encontrou conflito.', undo.rowCount ? 'error' : 'warning'); op.state = 'ABORTED';
   } else { step(op, 'COMMIT', 'MongoDB atualizado com bloqueio otimista.'); op.state = 'COMMITTED'; }
   await saveLog(op); return op;
 }
 
 export async function snapshot() {
-  const [pgRows, mongoRows] = await Promise.all([
+  const [pgRows, mongoRows, operationRows] = await Promise.all([
     pool.query('SELECT id,name,email,status,version,created_at FROM customers ORDER BY created_at DESC'),
-    db().collection('customers').find({}, { projection: { _id: 0, createdAt: 0 } }).toArray()
+    db().collection('customers').find({}, { projection: { _id: 0, createdAt: 0 } }).toArray(),
+    pool.query('SELECT id,scenario,state,steps,created_at FROM operation_log ORDER BY created_at DESC LIMIT 15')
   ]);
-  return { postgres: pgRows.rows, mongo: mongoRows, operations: recentOperations(), observedAt: new Date().toISOString() };
+  const operations = operationRows.rows.map(row => ({ id: row.id, scenario: row.scenario, state: row.state, steps: row.steps, startedAt: row.created_at }));
+  return { postgres: pgRows.rows, mongo: mongoRows, operations, observedAt: new Date().toISOString() };
 }
